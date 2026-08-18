@@ -17,6 +17,7 @@ return new class extends Migration
             $table->decimal('price', 15, 2);
             $table->string('currency', 3)->default('USD');
             $table->unsignedInteger('quantity')->default(0);
+            $table->unsignedInteger('reserved_quantity')->default(0);
             $table->boolean('is_active')->default(true);
             $table->timestamps();
         });
