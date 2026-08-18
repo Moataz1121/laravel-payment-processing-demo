@@ -15,7 +15,12 @@ class Product extends Model
         'price',
         'currency',
         'quantity',
+        'reserved_quantity',
         'is_active',
+    ];
+
+    protected $appends = [
+        'available_quantity',
     ];
 
     protected function casts(): array
@@ -23,8 +28,17 @@ class Product extends Model
         return [
             'price' => 'decimal:2',
             'quantity' => 'integer',
+            'reserved_quantity' => 'integer',
             'is_active' => 'boolean',
         ];
+    }
+
+    /**
+     * Calculated available stock (total physical stock minus active reservations).
+     */
+    public function getAvailableQuantityAttribute(): int
+    {
+        return max(0, $this->quantity - $this->reserved_quantity);
     }
 
     public function orderItems(): HasMany

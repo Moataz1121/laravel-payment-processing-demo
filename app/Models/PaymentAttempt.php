@@ -13,6 +13,7 @@ class PaymentAttempt extends Model
 
     protected $fillable = [
         'payment_id',
+        'active_payment_id',
         'attempt_number',
         'status',
         'request_payload',

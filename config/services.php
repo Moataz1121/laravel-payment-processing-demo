@@ -35,4 +35,8 @@ return [
         ],
     ],
 
+    'moyasar' => [
+        'secret' => env('MOYASAR_SECRET_KEY', 'sk_test_xxx'),
+        'public' => env('MOYASAR_PUBLIC_KEY', 'pk_test_xxx'),
+    ],
 ];

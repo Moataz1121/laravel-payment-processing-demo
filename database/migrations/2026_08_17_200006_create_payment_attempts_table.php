@@ -23,6 +23,10 @@ return new class extends Migration
             $table->timestamp('started_at')->nullable();
             $table->timestamp('finished_at')->nullable();
             $table->timestamps();
+
+            $table->uuid('active_payment_id')->nullable();
+            $table->unique('active_payment_id');
+            $table->unique(['payment_id', 'attempt_number']);
         });
     }
 
