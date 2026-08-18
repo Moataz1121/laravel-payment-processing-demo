@@ -1,58 +1,183 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# High-Concurrency & Multi-Gateway Payment Processing Architecture
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+A production-grade, transactionally consistent, high-concurrency Laravel payment processing engine. Designed with strict database-level idempotency, pessimistic inventory reservation locking, short DB transaction boundaries, and a extensible Strategy/Factory design pattern for payment gateways.
 
-## About Laravel
+---
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+## Key Architectural Principles
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+### 1. Concurrency & Race Condition Safeguards
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+* **Pessimistic Inventory Locking (`SELECT ... FOR UPDATE`)**:
+  When a user initiates checkout, product rows are locked using `lockForUpdate()`. Available stock is validated strictly as:
+  $$\text{Available Stock} = \text{quantity} - \text{reserved\_quantity}$$
+  If available stock is sufficient, `reserved_quantity` is incremented.
 
-## Learning Laravel
+* **Deterministic Lock Ordering (Deadlock Prevention)**:
+  To prevent database deadlocks under high-concurrency traffic, products are locked in strict ascending order by ID:
+  ```php
+  $products = Product::whereIn('id', $productIds)
+      ->orderBy('id', 'asc')
+      ->lockForUpdate()
+      ->get();
+  ```
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+* **Short DB Lock Boundaries**:
+  External HTTP API calls to payment gateways (e.g., Moyasar, Stripe) are executed **outside** database transactions. Database locks (~1ms) are held exclusively during local state claims and updates.
 
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+* **Database Engine Single Active Attempt Ownership**:
+  To prevent multiple background workers from processing the same payment simultaneously, `payment_attempts` enforces a database-level unique constraint on `active_payment_id`. Only one active attempt (`finished_at IS NULL`) can exist per payment at any time.
 
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
+---
 
-## Agentic Development
+### 2. Double-Layered Idempotency
 
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
+#### Layer 1: Application-Level Idempotency (`idempotency_key`)
+* Supported via a database-level unique index on `payments`:
+  ```sql
+  UNIQUE(user_id, idempotency_key)
+  ```
+* Repeating a checkout request with the same `idempotency_key` guarantees that no duplicate orders, payments, or stock reservations are created. The existing payment details are returned with `is_idempotent => true`.
 
-```bash
-composer require laravel/boost --dev
+#### Layer 2: Gateway-Level Idempotency (`pay_idem_{payment_id}`)
+* Protects customers from double-charging during network timeouts or retries.
+* Every gateway request sends a stable, deterministic idempotency key (`pay_idem_{payment_id}`). If a network timeout occurs and the request is retried, the payment provider recognizes the key and returns the original transaction result without charging the customer twice.
 
-php artisan boost:install
+---
+
+### 3. Payment State Machine & Regression Protection
+
+Payment state transitions are strictly governed by `App\Enums\PaymentStatus`:
+
+* **Terminal States**: `COMPLETED`, `CANCELLED`, `EXPIRED`, and `REFUNDED` cannot be retried or regressed.
+* **Late Response Guard**: If a fast webhook marks a payment `COMPLETED` while a worker HTTP request is still in-flight, the late worker response will record the attempt log but **will NOT regress** the payment status from `COMPLETED` to `PROCESSING` or `FAILED`.
+
+---
+
+## Extending Payment Gateways (Factory & Strategy Pattern)
+
+The system uses a decoupled Strategy and Factory design pattern. Adding a new payment gateway (e.g., PayTabs, Fawry, PayPal) requires zero modifications to core business logic or checkout controllers.
+
+```
+                    +--------------------------------+
+                    |    PaymentGatewayInterface     |
+                    +---------------+----------------+
+                                    |
+            +-----------------------+-----------------------+
+            |                       |                       |
++-----------v-----------+ +---------v-----------+ +---------v-----------+
+| MoyasarPaymentGateway | | StripePaymentGateway| |  NewPaymentGateway  |
++-----------------------+ +---------------------+ +---------------------+
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+### Steps to Add a New Payment Gateway Strategy
 
-## Contributing
+#### Step 1: Create the Strategy Class
+Create a new strategy class in `app/Services/PaymentHandlers/Strategies/` implementing `PaymentGatewayInterface`:
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+```php
+namespace App\Services\PaymentHandlers\Strategies;
 
-## Code of Conduct
+use App\Models\Payment;
+use App\Services\PaymentHandlers\Contracts\PaymentGatewayInterface;
+use Illuminate\Http\Request;
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+class TapPaymentGateway implements PaymentGatewayInterface
+{
+    public function processPayment(Payment $payment, ?string $gatewayIdempotencyKey = null): array
+    {
+        $idempotencyKey = $gatewayIdempotencyKey ?? ("pay_idem_" . $payment->id);
 
-## Security Vulnerabilities
+        // 1. Call Gateway API with idempotencyKey
+        // 2. Return standardized array
+        return [
+            'success' => true,
+            'payment_id' => $payment->id,
+            'transaction_id' => 'TAP-TXN-12345',
+            'status' => 'processing',
+            'payment_url' => 'https://checkout.tap.company/...',
+            'message' => 'Tap checkout session created',
+            'retryable' => false,
+        ];
+    }
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+    public function callback(Request $request): array
+    {
+        // Handle browser callback verification
+    }
 
-## License
+    public function handleWebhook(Request $request): array
+    {
+        // Handle server-to-server webhook verification
+    }
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+    public function processRefund(Payment $payment, float $amount, ?string $reason = null): array
+    {
+        // Process refund via API
+    }
+}
+```
+
+#### Step 2: Register Strategy in `PaymentGatewayFactory`
+Add the new strategy mapping inside `app/Services/PaymentHandlers/PaymentGatewayFactory.php`:
+
+```php
+public function create(PaymentGateway|string $gateway): PaymentGatewayInterface
+{
+    $slug = strtolower($gateway instanceof PaymentGateway ? $gateway->slug : $gateway);
+
+    return match ($slug) {
+        'moyasar' => app(MoyasarPaymentGateway::class),
+        'stripe' => app(StripePaymentGateway::class),
+        'tap' => app(TapPaymentGateway::class), // <-- Registered here
+        default => app(MockPaymentGateway::class),
+    };
+}
+```
+
+#### Step 3: Add Gateway Record in Database
+Seed or insert a record into the `payment_gateways` table:
+
+```sql
+INSERT INTO payment_gateways (id, name, slug, is_enabled, creds)
+VALUES ('01a014af-xxxx-xxxx-xxxx-xxxxxxxxxxxx', 'Tap Payments', 'tap', true, '{"secret_key": "sk_test_xxx"}');
+```
+
+---
+
+## Inventory Lifecycle
+
+```
+[ Checkout Initiated ] 
+        |
+        v
+  reserved_quantity += quantity  (Physical stock unchanged)
+        |
+        +-----------------------+-----------------------+
+        |                                               |
+        v                                               v
+[ Payment COMPLETED ]                         [ Payment FAILED / CANCELLED ]
+        |                                               |
+        v                                               v
+  quantity -= order_qty                         reserved_quantity -= order_qty
+  reserved_quantity -= order_qty                (Physical stock untouched)
+  (Converted to Sold Stock)
+```
+
+---
+
+## Running Test Suite
+
+Run the full PHPUnit concurrency and integration test suite:
+
+```bash
+./vendor/bin/phpunit
+```
+
+To run feature concurrency tests specifically:
+
+```bash
+./vendor/bin/phpunit --filter=InventoryAndConcurrencyTest
+./vendor/bin/phpunit --filter=PaymentRetryTest
+./vendor/bin/phpunit --filter=PaymentEventsTest
+```
